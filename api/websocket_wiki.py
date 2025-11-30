@@ -16,6 +16,7 @@ from api.openrouter_client import OpenRouterClient
 from api.azureai_client import AzureAIClient
 from api.dashscope_client import DashscopeClient
 from api.rag import RAG
+from api.prompts import DFD_SYSTEM_PROMPT
 
 # Configure logging
 from api.logging_config import setup_logging
@@ -174,6 +175,14 @@ async def handle_websocket_chat(websocket: WebSocket):
                     # Replace the continuation message with the original topic
                     last_message.content = original_topic
                     logger.info(f"Using original topic for research: {original_topic}")
+
+        # Check for DFD request
+        is_dfd_request = False
+        if "/dfd" in last_message.content:
+            is_dfd_request = True
+            # Remove the command from the content
+            last_message.content = last_message.content.replace("/dfd", "").strip()
+            logger.info("DFD request detected")
 
         # Get the query from the last message
         query = last_message.content
@@ -344,6 +353,13 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Use markdown formatting to improve readability
 - Cite specific files and code sections when relevant
 </style>"""
+        elif is_dfd_request:
+            system_prompt = DFD_SYSTEM_PROMPT.format(
+                repo_type=repo_type,
+                repo_url=repo_url,
+                repo_name=repo_name,
+                language_name=language_name
+            )
         else:
             system_prompt = f"""<role>
 You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
