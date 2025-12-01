@@ -16,7 +16,7 @@ from api.openrouter_client import OpenRouterClient
 from api.azureai_client import AzureAIClient
 from api.dashscope_client import DashscopeClient
 from api.rag import RAG
-from api.prompts import DFD_SYSTEM_PROMPT
+from api.prompts import DFD_SYSTEM_PROMPT, STRIDE_SYSTEM_PROMPT, CONCISE_DFD_PROMPT, OWASP_THREAT_MODEL_SCHEMA
 
 # Configure logging
 from api.logging_config import setup_logging
@@ -49,6 +49,78 @@ class ChatCompletionRequest(BaseModel):
     excluded_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to exclude from processing")
     included_dirs: Optional[str] = Field(None, description="Comma-separated list of directories to include exclusively")
     included_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to include exclusively")
+
+def get_model_client(provider: str, model_name: str, model_config: Dict[str, Any]):
+    """
+    Initialize and return the appropriate model client based on the provider.
+    """
+    if provider == "ollama":
+        model = OllamaClient()
+        model_kwargs = {
+            "model": model_config["model"],
+            "stream": True,
+            "options": {
+                "temperature": model_config["temperature"],
+                "top_p": model_config["top_p"],
+                "num_ctx": model_config["num_ctx"]
+            }
+        }
+        return model, model_kwargs
+    elif provider == "openrouter":
+        if not OPENROUTER_API_KEY:
+            logger.warning("OPENROUTER_API_KEY not configured")
+        
+        model = OpenRouterClient()
+        model_kwargs = {
+            "model": model_name,
+            "stream": True,
+            "temperature": model_config["temperature"]
+        }
+        if "top_p" in model_config:
+            model_kwargs["top_p"] = model_config["top_p"]
+        return model, model_kwargs
+    elif provider == "openai":
+        if not OPENAI_API_KEY:
+            logger.warning("OPENAI_API_KEY not configured")
+            
+        model = OpenAIClient()
+        model_kwargs = {
+            "model": model_name,
+            "stream": True,
+            "temperature": model_config["temperature"]
+        }
+        if "top_p" in model_config:
+            model_kwargs["top_p"] = model_config["top_p"]
+        return model, model_kwargs
+    elif provider == "azure":
+        model = AzureAIClient()
+        model_kwargs = {
+            "model": model_name,
+            "stream": True,
+            "temperature": model_config["temperature"],
+            "top_p": model_config.get("top_p")
+        }
+        return model, model_kwargs
+    elif provider == "dashscope":
+        model = DashscopeClient()
+        model_kwargs = {
+            "model": model_name,
+            "stream": True,
+            "temperature": model_config["temperature"],
+            "top_p": model_config.get("top_p")
+        }
+        return model, model_kwargs
+    else:
+        # Google Generative AI
+        model = genai.GenerativeModel(
+            model_name=model_config["model"],
+            generation_config={
+                "temperature": model_config["temperature"],
+                "top_p": model_config["top_p"],
+                "top_k": model_config.get("top_k")
+            }
+        )
+        return model, {}
 
 async def handle_websocket_chat(websocket: WebSocket):
     """
@@ -184,6 +256,14 @@ async def handle_websocket_chat(websocket: WebSocket):
             last_message.content = last_message.content.replace("/dfd", "").strip()
             logger.info("DFD request detected")
 
+        # Check for STRIDE request
+        is_stride_request = False
+        if "/stride" in last_message.content:
+            is_stride_request = True
+            # Remove the command from the content
+            last_message.content = last_message.content.replace("/stride", "").strip()
+            logger.info("STRIDE request detected")
+
         # Get the query from the last message
         query = last_message.content
 
@@ -251,6 +331,129 @@ async def handle_websocket_chat(websocket: WebSocket):
         language_code = request.language or configs["lang_config"]["default"]
         supported_langs = configs["lang_config"]["supported_languages"]
         language_name = supported_langs.get(language_code, "English")
+
+        # Initialize model client
+        model_config = get_model_config(request.provider, request.model)["model_kwargs"]
+        model, model_kwargs = get_model_client(request.provider, request.model, model_config)
+
+        # Intermediate DFD Generation
+        generated_dfd = ""
+        if is_stride_request:
+            # Generate full DFD for STRIDE analysis
+            logger.info("Generating internal DFD for STRIDE analysis...")
+            dfd_prompt = DFD_SYSTEM_PROMPT.format(
+                repo_type=repo_type,
+                repo_url=repo_url,
+                repo_name=repo_name,
+                language_name=language_name
+            )
+            
+            # Construct prompt for DFD generation
+            full_dfd_prompt = f"/no_think {dfd_prompt}\n\n"
+            if context_text.strip():
+                full_dfd_prompt += f"<START_OF_CONTEXT>\n{context_text}\n<END_OF_CONTEXT>\n\n"
+            full_dfd_prompt += f"<query>Generate a comprehensive Data Flow Diagram for this system.</query>\n\nAssistant: "
+
+            if request.provider == "ollama":
+                full_dfd_prompt += " /no_think"
+
+            # Call model (non-streaming if possible, or collect stream)
+            # For simplicity, we'll reuse the streaming client and collect chunks
+            # Note: Ideally we should use a non-streaming call, but the client setup is for streaming.
+            # We'll collect the stream.
+            
+            dfd_response_text = ""
+            try:
+                # Create api_kwargs for DFD generation
+                dfd_api_kwargs = model.convert_inputs_to_api_kwargs(
+                    input=full_dfd_prompt,
+                    model_kwargs=model_kwargs,
+                    model_type=ModelType.LLM
+                )
+                
+                # We need to handle different providers again here or assume the client interface is consistent
+                # The helper returns (model, model_kwargs). We need to call it.
+                # Since the clients have different interfaces (acall vs generate_content), we might need another helper or just handle it.
+                # To avoid code duplication, let's assume we can use the same logic as the main response loop but collect instead of send.
+                
+                # Actually, let's implement a quick helper for non-streaming generation or just do it inline
+                if request.provider == "google":
+                    resp = model.generate_content(full_dfd_prompt)
+                    dfd_response_text = resp.text
+                else:
+                    response = await model.acall(api_kwargs=dfd_api_kwargs, model_type=ModelType.LLM)
+                    async for chunk in response:
+                        if request.provider == "ollama":
+                            text = getattr(chunk, 'response', None) or getattr(chunk, 'text', None) or str(chunk)
+                            if text and not text.startswith('model=') and not text.startswith('created_at='):
+                                dfd_response_text += text.replace('<think>', '').replace('</think>', '')
+                        elif request.provider == "openai" or request.provider == "azure" or request.provider == "dashscope":
+                            choices = getattr(chunk, "choices", [])
+                            if len(choices) > 0:
+                                delta = getattr(choices[0], "delta", None)
+                                if delta is not None:
+                                    text = getattr(delta, "content", None)
+                                    if text is not None:
+                                        dfd_response_text += text
+                        elif request.provider == "openrouter":
+                            dfd_response_text += str(chunk)
+                            
+                generated_dfd = dfd_response_text
+                logger.info("Internal DFD generated successfully")
+                
+            except Exception as e:
+                logger.error(f"Error generating internal DFD: {str(e)}")
+                generated_dfd = "Error generating DFD. Proceeding with raw context."
+
+        elif not is_dfd_request and not is_deep_research:
+            # Generate Concise DFD for normal chat
+            logger.info("Generating concise DFD for context...")
+            # Construct prompt
+            concise_prompt = f"/no_think {CONCISE_DFD_PROMPT}\n\n"
+            if context_text.strip():
+                concise_prompt += f"<START_OF_CONTEXT>\n{context_text}\n<END_OF_CONTEXT>\n\n"
+            concise_prompt += f"<query>Generate a concise DFD.</query>\n\nAssistant: "
+            
+            if request.provider == "ollama":
+                concise_prompt += " /no_think"
+                
+            # Call model to get concise DFD
+            # Similar logic to above, collecting the response
+            dfd_response_text = ""
+            try:
+                if request.provider == "google":
+                    resp = model.generate_content(concise_prompt)
+                    dfd_response_text = resp.text
+                else:
+                    # We need to recreate api_kwargs because the input changed
+                    concise_api_kwargs = model.convert_inputs_to_api_kwargs(
+                        input=concise_prompt,
+                        model_kwargs=model_kwargs,
+                        model_type=ModelType.LLM
+                    )
+                    response = await model.acall(api_kwargs=concise_api_kwargs, model_type=ModelType.LLM)
+                    async for chunk in response:
+                        if request.provider == "ollama":
+                            text = getattr(chunk, 'response', None) or getattr(chunk, 'text', None) or str(chunk)
+                            if text and not text.startswith('model=') and not text.startswith('created_at='):
+                                dfd_response_text += text.replace('<think>', '').replace('</think>', '')
+                        elif request.provider == "openai" or request.provider == "azure" or request.provider == "dashscope":
+                            choices = getattr(chunk, "choices", [])
+                            if len(choices) > 0:
+                                delta = getattr(choices[0], "delta", None)
+                                if delta is not None:
+                                    text = getattr(delta, "content", None)
+                                    if text is not None:
+                                        dfd_response_text += text
+                        elif request.provider == "openrouter":
+                            dfd_response_text += str(chunk)
+                            
+                generated_dfd = dfd_response_text
+                logger.info(f"Concise DFD generated: {generated_dfd[:100]}...")
+            except Exception as e:
+                logger.error(f"Error generating concise DFD: {str(e)}")
+                # Don't fail the request, just continue without DFD
+                generated_dfd = ""
 
         # Create system prompt
         if is_deep_research:
@@ -353,6 +556,14 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Use markdown formatting to improve readability
 - Cite specific files and code sections when relevant
 </style>"""
+        elif is_stride_request:
+            system_prompt = STRIDE_SYSTEM_PROMPT.format(
+                repo_type=repo_type,
+                repo_url=repo_url,
+                repo_name=repo_name,
+                language_name=language_name,
+                owasp_schema=OWASP_THREAT_MODEL_SCHEMA
+            )
         elif is_dfd_request:
             system_prompt = DFD_SYSTEM_PROMPT.format(
                 repo_type=repo_type,
@@ -433,6 +644,11 @@ This file contains...
         # Only include context if it's not empty
         CONTEXT_START = "<START_OF_CONTEXT>"
         CONTEXT_END = "<END_OF_CONTEXT>"
+        
+        # Inject Generated DFD into context if available
+        if generated_dfd:
+            context_text = f"## Generated Data Flow Diagram (Architectural Context)\n{generated_dfd}\n\n" + context_text
+            
         if context_text.strip():
             prompt += f"{CONTEXT_START}\n{context_text}\n{CONTEXT_END}\n\n"
         else:
@@ -442,118 +658,15 @@ This file contains...
 
         prompt += f"<query>\n{query}\n</query>\n\nAssistant: "
 
-        model_config = get_model_config(request.provider, request.model)["model_kwargs"]
-
         if request.provider == "ollama":
             prompt += " /no_think"
 
-            model = OllamaClient()
-            model_kwargs = {
-                "model": model_config["model"],
-                "stream": True,
-                "options": {
-                    "temperature": model_config["temperature"],
-                    "top_p": model_config["top_p"],
-                    "num_ctx": model_config["num_ctx"]
-                }
-            }
-
-            api_kwargs = model.convert_inputs_to_api_kwargs(
-                input=prompt,
-                model_kwargs=model_kwargs,
-                model_type=ModelType.LLM
-            )
-        elif request.provider == "openrouter":
-            logger.info(f"Using OpenRouter with model: {request.model}")
-
-            # Check if OpenRouter API key is set
-            if not OPENROUTER_API_KEY:
-                logger.warning("OPENROUTER_API_KEY not configured, but continuing with request")
-                # We'll let the OpenRouterClient handle this and return a friendly error message
-
-            model = OpenRouterClient()
-            model_kwargs = {
-                "model": request.model,
-                "stream": True,
-                "temperature": model_config["temperature"]
-            }
-            # Only add top_p if it exists in the model config
-            if "top_p" in model_config:
-                model_kwargs["top_p"] = model_config["top_p"]
-
-            api_kwargs = model.convert_inputs_to_api_kwargs(
-                input=prompt,
-                model_kwargs=model_kwargs,
-                model_type=ModelType.LLM
-            )
-        elif request.provider == "openai":
-            logger.info(f"Using Openai protocol with model: {request.model}")
-
-            # Check if an API key is set for Openai
-            if not OPENAI_API_KEY:
-                logger.warning("OPENAI_API_KEY not configured, but continuing with request")
-                # We'll let the OpenAIClient handle this and return an error message
-
-            # Initialize Openai client
-            model = OpenAIClient()
-            model_kwargs = {
-                "model": request.model,
-                "stream": True,
-                "temperature": model_config["temperature"]
-            }
-            # Only add top_p if it exists in the model config
-            if "top_p" in model_config:
-                model_kwargs["top_p"] = model_config["top_p"]
-
-            api_kwargs = model.convert_inputs_to_api_kwargs(
-                input=prompt,
-                model_kwargs=model_kwargs,
-                model_type=ModelType.LLM
-            )
-        elif request.provider == "azure":
-            logger.info(f"Using Azure AI with model: {request.model}")
-
-            # Initialize Azure AI client
-            model = AzureAIClient()
-            model_kwargs = {
-                "model": request.model,
-                "stream": True,
-                "temperature": model_config["temperature"],
-                "top_p": model_config["top_p"]
-            }
-
-            api_kwargs = model.convert_inputs_to_api_kwargs(
-                input=prompt,
-                model_kwargs=model_kwargs,
-                model_type=ModelType.LLM
-            )
-        elif request.provider == "dashscope":
-            logger.info(f"Using Dashscope with model: {request.model}")
-
-            # Initialize Dashscope client
-            model = DashscopeClient()
-            model_kwargs = {
-                "model": request.model,
-                "stream": True,
-                "temperature": model_config["temperature"],
-                "top_p": model_config["top_p"]
-            }
-
-            api_kwargs = model.convert_inputs_to_api_kwargs(
-                input=prompt,
-                model_kwargs=model_kwargs,
-                model_type=ModelType.LLM
-            )
-        else:
-            # Initialize Google Generative AI model
-            model = genai.GenerativeModel(
-                model_name=model_config["model"],
-                generation_config={
-                    "temperature": model_config["temperature"],
-                    "top_p": model_config["top_p"],
-                    "top_k": model_config["top_k"]
-                }
-            )
+        # Update api_kwargs with the final prompt
+        api_kwargs = model.convert_inputs_to_api_kwargs(
+            input=prompt,
+            model_kwargs=model_kwargs,
+            model_type=ModelType.LLM
+        )
 
         # Process the response based on the provider
         try:
